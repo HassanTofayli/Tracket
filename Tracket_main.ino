@@ -5,12 +5,18 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include <HardwareSerial.h>
+#include <TinyGPS++.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
 
 #define FORMAT_LITTLEFS_IF_FAILED true
 
-long timezone = 1;
-byte daysavetime = 1;
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7200;      // GMT offset: UTC+2 (Lebanon Standard Time)
+const int daylightOffset_sec = 3600;  // Daylight offset: UTC+3 (Lebanon Daylight Time)
 
 const char* config_filename = "/config.json";
 const int serialNumber = 123456;
@@ -21,21 +27,16 @@ int memorySize;
 int version;
 String sensors;
 bool wifi_connected = false;
-WiFiManager wm;
 unsigned long lastTime = 0;
-String configPasteKey = "v8TbLWDj";
-String configPasteLink = "https://pastebin.com/api/api_raw.php?i=" + configPasteKey;
 bool configFetchingSucc = false;
-String api_dev_key = "nbDlIM7wkLevjB6-wdT__xI2nSHhLnhW";
-String api_user_name = "HassanTofayli";
-String api_user_password = "Tracket.vehiclecontrolsystem";
-String vehiclePasteKey = "";
-String api_user_key;
 const char* serverUrl = "http://192.168.1.109:3000/esp";
-WiFiClient wifiClient;
-HTTPClient httpClient;
-HardwareSerial SerialGPS(2);   // Define the serial port to use for the GPS module
-char gpsData[256]; // Declare a character array to store GPS data
+DynamicJsonDocument dataToSend(1024);
+WiFiManager wm;
+TinyGPSPlus gps;  // Create a TinyGPS++ object to handle GPS data
+WebServer server(80);
+Adafruit_MPU6050 mpu;
+
+
 
 void writeFile(String filename, String message) {
   File file = LittleFS.open(filename, "w");
@@ -118,7 +119,7 @@ bool saveConfig() {
   writeFile(config_filename, tmp);
 
   String s = printFile(config_filename);
-  Serial.print(s + " \nbool saveConfig() {everythingisSuccess}");
+  Serial.print("The saved config is: \n" + s);
 
   return true;
 }
@@ -226,9 +227,9 @@ String httpGETRequest(const char* serverName) {
   String payload = "false";
 
   if (httpResponseCode > 0) {
-    Serial.print("HTTP Response code: ");
+    Serial.print("HTTP Response code for url: ");
     Serial.println(serverName);
-    Serial.println(httpResponseCode);
+    Serial.println("response code: " + httpResponseCode);
     payload = http.getString();
   } else {
     Serial.print("Error code: ");
@@ -238,42 +239,6 @@ String httpGETRequest(const char* serverName) {
   http.end();
 
   return payload;
-}
-
-String getPrivatePaste(String url) {
-  HTTPClient http;
-  if (api_user_key == "NoKey") {
-    Serial.println("No User Key Found To Get the Private Paste");
-    return "false";
-  }
-  http.begin("https://pastebin.com/api/api_raw.php");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.POST("api_dev_key=" + api_dev_key + "&api_user_key=" + api_user_key + "&api_option=show_paste&api_paste_key=" + configPasteKey);
-
-  // Check the response
-  String payload = http.getString();
-  Serial.println("Peivate Paste Content: " + payload);
-  http.end();
-  return payload;
-}
-String configFetching() {
-
-  String configJson = getPrivatePaste(configPasteLink);
-  if (configJson != "false") {
-    configFetchingSucc = true;
-    Serial.println("Config File: " + configJson);
-    DynamicJsonDocument doc(1024);
-    deserializeJson(doc, configJson);
-    String outputString;
-    serializeJson(doc, outputString);
-    Serial.println(outputString);
-    vehiclePasteKey = searchJson(outputString);
-    Serial.println(vehiclePasteKey);
-  } else {
-    Serial.print("Error: ");
-    Serial.println(configJson);
-  }
-  return configJson;
 }
 String searchJson(String jsonContent) {
   DynamicJsonDocument doc(1024);
@@ -290,40 +255,7 @@ String searchJson(String jsonContent) {
 
   return "false";  // Return "false" if the key is not found
 }
-String createNewPaste() {
-  String url = "https://pastebin.com/api/api_post.php";
-  String postData = "api_option=paste&api_user_key=" + api_user_key + "&api_paste_private=2&api_paste_name=My%20Private%20Paste&api_paste_expire_date=N&api_dev_key=" + String(api_dev_key) + "&api_paste_code=This%20is%20my%20private%20paste%20content.";
-  httpClient.begin(url);
-  httpClient.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  int httpCode = httpClient.POST(postData);
-  String response = httpClient.getString();
-  httpClient.end();
-  if (httpCode == HTTP_CODE_OK) {
-    Serial.println("Paste created. URL: " + response);
-  } else {
-    Serial.println("Error creating paste");
-  }
-}
-String getUserApiKey() {
-
-  HTTPClient http;
-  http.begin("https://pastebin.com/api/api_login.php");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.POST("api_dev_key=" + api_dev_key + "&api_user_name=" + api_user_name + "&api_user_password=" + api_user_password);
-
-  // Check the response
-  String response = http.getString();
-  if (response.startsWith("Bad API request")) {
-    Serial.println("Login failed: " + response);
-    return "NoKey";
-  }
-
-  http.end();
-  Serial.println("getUserApiKey: " + response);
-  return response;
-}
-
-void sendTextData( String data) {
+void sendData(String data) {
   HTTPClient http;
   String serverUrl = "http://192.168.1.109:3000/esp";
   http.begin(serverUrl);
@@ -332,12 +264,13 @@ void sendTextData( String data) {
   http.addHeader("X-Sensor", "DHT11");
   http.addHeader("X-Temp", "25");
   http.addHeader("X-Humidity", "50");
+  dataToSend["message"] = data;
+  dataToSend["timestamp"] = millis();
 
-  StaticJsonDocument<200> jsonDoc;
-  jsonDoc["message"] = data;
-  jsonDoc["timestamp"] = millis();
+
   String requestBody;
-  serializeJson(jsonDoc, requestBody);
+  serializeJson(dataToSend, requestBody);
+  Serial.println(requestBody);
   int httpResponse = http.POST(requestBody);
   if (httpResponse > 0) {
     Serial.print("HTTP Response code: ");
@@ -351,16 +284,225 @@ void sendTextData( String data) {
   http.end();
 }
 
+bool printLocalTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return false;
+  }
+  int dayOfWeek = timeinfo.tm_wday;
+  int month = timeinfo.tm_mon + 1;  // tm_mon ranges from 0 to 11, so add 1
+  int dayOfMonth = timeinfo.tm_mday;
+  int year = timeinfo.tm_year + 1900;  // tm_year is the number of years since 1900
+  int hour = timeinfo.tm_hour;
+  int minute = timeinfo.tm_min;
+  int second = timeinfo.tm_sec;
+
+  Serial.print("Day of the week: ");
+  Serial.println(dayOfWeek);
+  Serial.print("Month: ");
+  Serial.println(month);
+  Serial.print("Day of the Month: ");
+  Serial.println(dayOfMonth);
+  Serial.print("Year: ");
+  Serial.println(year);
+  Serial.print("Hour: ");
+  Serial.println(hour);
+  Serial.print("Minute: ");
+  Serial.println(minute);
+  Serial.print("Second: ");
+  Serial.println(second);
+
+  //
+  // Set the time components in the JSON object
+  dataToSend["time"]["dayOfWeek"] = dayOfWeek;
+  dataToSend["time"]["month"] = month;
+  dataToSend["time"]["dayOfMonth"] = dayOfMonth;
+  dataToSend["time"]["year"] = year;
+  dataToSend["time"]["hour"] = hour;
+  dataToSend["time"]["minute"] = minute;
+  dataToSend["time"]["second"] = second;
+
+  return true;
+}
 
 
+
+
+void handleRoot() {
+
+  char temp[400];
+  int sec = millis() / 1000;
+  int min = sec / 60;
+  int hr = min / 60;
+
+  snprintf(temp, 400,
+
+           "<html>\
+  <head>\
+    <meta http-equiv='refresh' content='5'/>\
+    <title>ESP32 Demo</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+    </style>\
+  </head>\
+  <body>\
+    <h1>Hello from ESP32!</h1>\
+    <p>Uptime: %02d:%02d:%02d</p>\
+  </body>\
+  </html>",
+
+           hr, min % 60, sec % 60);
+  server.send(200, "text/html", temp);
+}
+void sendUpdate() {
+  String str;
+  serializeJson(dataToSend, str);
+  server.send(200, "text/json", str);
+}
+
+
+
+
+
+bool getGPS() {
+  bool updated = false;
+  // Read data from the GPS module
+  while (Serial2.available() > 0) {
+    if (gps.encode(Serial2.read())) {
+      // Check if new GPS data is available
+      if (gps.location.isUpdated()) {
+        // Retrieve latitude and longitude
+        float latitude = gps.location.lat();
+        float longitude = gps.location.lng();
+        dataToSend["gps"]["latitude"] = latitude;
+        dataToSend["gps"]["longitude"] = longitude;
+        // Create a string to store the formatted latitude and longitude
+        updated = true;
+      }
+    }
+  }
+  return updated;
+}
+void setupAccelerometer() {
+  int i = 0;
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    while (i < 100) {
+      delay(10);
+      i++;
+    }
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  Serial.print("Accelerometer range set to: ");
+  switch (mpu.getAccelerometerRange()) {
+    case MPU6050_RANGE_2_G:
+      Serial.println("+-2G");
+      break;
+    case MPU6050_RANGE_4_G:
+      Serial.println("+-4G");
+      break;
+    case MPU6050_RANGE_8_G:
+      Serial.println("+-8G");
+      break;
+    case MPU6050_RANGE_16_G:
+      Serial.println("+-16G");
+      break;
+  }
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  Serial.print("Gyro range set to: ");
+  switch (mpu.getGyroRange()) {
+    case MPU6050_RANGE_250_DEG:
+      Serial.println("+- 250 deg/s");
+      break;
+    case MPU6050_RANGE_500_DEG:
+      Serial.println("+- 500 deg/s");
+      break;
+    case MPU6050_RANGE_1000_DEG:
+      Serial.println("+- 1000 deg/s");
+      break;
+    case MPU6050_RANGE_2000_DEG:
+      Serial.println("+- 2000 deg/s");
+      break;
+  }
+
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.print("Filter bandwidth set to: ");
+  switch (mpu.getFilterBandwidth()) {
+    case MPU6050_BAND_260_HZ:
+      Serial.println("260 Hz");
+      break;
+    case MPU6050_BAND_184_HZ:
+      Serial.println("184 Hz");
+      break;
+    case MPU6050_BAND_94_HZ:
+      Serial.println("94 Hz");
+      break;
+    case MPU6050_BAND_44_HZ:
+      Serial.println("44 Hz");
+      break;
+    case MPU6050_BAND_21_HZ:
+      Serial.println("21 Hz");
+      break;
+    case MPU6050_BAND_10_HZ:
+      Serial.println("10 Hz");
+      break;
+    case MPU6050_BAND_5_HZ:
+      Serial.println("5 Hz");
+      break;
+  }
+}
+void getAccelerometer(){
+  /* Get new sensor events with the readings */
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  /* Add accelerometer values */
+  dataToSend["accelerometer"]["AccelerationX"] = a.acceleration.x;
+  dataToSend["accelerometer"]["AccelerationY"] = a.acceleration.y;
+  dataToSend["accelerometer"]["AccelerationZ"] = a.acceleration.z;
+
+  /* Add gyroscope values */
+  dataToSend["gyroscope"]["RotationX"] = g.gyro.x;
+  dataToSend["gyroscope"]["RotationY"] = g.gyro.y;
+  dataToSend["gyroscope"]["RotationZ"] = g.gyro.z;
+
+  /* Add temperature value */
+  dataToSend["temperature"] = temp.temperature;
+
+  /* Print out the values */
+  Serial.print("Acceleration X: ");
+  Serial.print(a.acceleration.x);
+  Serial.print(", Y: ");
+  Serial.print(a.acceleration.y);
+  Serial.print(", Z: ");
+  Serial.print(a.acceleration.z);
+  Serial.println(" m/s^2");
+
+  Serial.print("Rotation X: ");
+  Serial.print(g.gyro.x);
+  Serial.print(", Y: ");
+  Serial.print(g.gyro.y);
+  Serial.print(", Z: ");
+  Serial.print(g.gyro.z);
+  Serial.println(" rad/s");
+
+  Serial.print("Temperature: ");
+  Serial.print(temp.temperature);
+  Serial.println(" degC");
+
+  Serial.println("");
+}
 
 void setup() {
+
+
+
   Serial.begin(115200);
-  SerialGPS.begin(9600, SERIAL_8N1, 3, 1); // Initialize the GPS module serial port
+  // neogps.begin(9600, SERIAL_8N1, 16, 17);  // Initialize the GPS module serial port at 9600 baud
   wm.setConfigPortalBlocking(false);
   wm.setTimeout(30);
   wm.autoConnect("ESP32-HassanTofayli");
-
+  sendData("hi from beg");
 
 
   if (!LittleFS.begin(false)) {
@@ -387,35 +529,39 @@ void setup() {
     }
   }
   Serial.println("My serialNumber is: " + String(serialNumber));
-  api_user_key = getUserApiKey();
-  // Serial.println(api_user_key);
-  // if(api_user_key!="NoKey"){
-  //   configFetching();
-  // createNewPaste();
-  // }
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  printLocalTime();
 
-  // // Get user key
-  // HTTPClient http;
-  // String url = "https://pastebin.com/api/api_login.php";
-  // String postData = "api_option=login&api_user_name=" + String(api_user_name) + "&api_user_password=" + String(api_user_password) + "&api_dev_key=" + String(api_dev_key);
-  // http.begin(url);
-  // http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  // int httpCode = http.POST(postData);
-  // String response = http.getString();
-  // http.end();
-  // if (httpCode == HTTP_CODE_OK) {
-  //   String api_user_key = response;
-  //   Serial.println("User key retrieved: " + api_user_key);
+  // accelometer gyroscope temprature sensor
+  setupAccelerometer();
 
-  // Create private paste
+
+  // WebServer Configuration
+  if (MDNS.begin("esp32")) {
+    Serial.println("MDNS responder started");
+  }
+  // End Points
+  server.on("/", handleRoot);
+  server.on("/getUpdate", sendUpdate);
+
+  server.begin();
+  Serial.println("HTTP server started");
+
+
+  // Serial of GPS data
+  Serial2.begin(9600);
+  while (!Serial2)
+    ;
+  Serial.println("GPS Module Example");
 }
 
 void loop() {
-
   if (WiFi.isConnected() || WiFi.status() != WL_CONNECTED) {
     // wm.stopConfigPortal();
     Serial.print("WiFi connected: ");
     Serial.println(WiFi.localIP());
+    String ipAddress = WiFi.localIP().toString();
+    dataToSend["ip_address"] = ipAddress;
   } else {
     Serial.println("No WiFi connected");
     wm.setConfigPortalBlocking(false);
@@ -425,24 +571,16 @@ void loop() {
       wm.stopConfigPortal();
     }
   }
-  if (SerialGPS.available()) { // Check if GPS data is available
-    Serial.write(SerialGPS.read()); // Echo GPS data to the Serial Monitor
-  }
-String gpsData = ""; // Declare a string variable to store GPS data
-  
-  // Wait for GPS data to become available
-  while (SerialGPS.available() > 0) {
-    char c = SerialGPS.read(); // Read character from GPS module
-    gpsData += c; // Append character to gpsData string
-    delay(1);
-  }
-  
-  if (gpsData.length() > 0) {
-    // Print GPS data to Serial Monitor
-    Serial.println(gpsData);
-  }
-  String dataToSend = gpsData;
-  sendTextData(dataToSend);
+  server.handleClient();
 
-  delay(5000);
+
+  dataToSend["currentTime"] = printLocalTime();
+
+  dataToSend["gps"]["updated"] = getGPS();
+
+  getAccelerometer();
+
+
+  sendData("No message");
+  delay(1000);
 }
