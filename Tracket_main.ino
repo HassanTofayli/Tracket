@@ -1,9 +1,10 @@
+#include <ArduinoJson.h>
+#include <ArduinoJson.hpp>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
 #include "FS.h"
 #include <LittleFS.h>
-#include <ArduinoJson.h>
 #include <time.h>
 #include <TinyGPS++.h>
 #include <WebServer.h>
@@ -14,44 +15,60 @@
 #include <ESP.h>
 
 #define FORMAT_LITTLEFS_IF_FAILED true
+#define CHUNK_SIZE 5000  // or as much as an HTTP POST request can handle
 
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 7200;      // GMT offset: UTC+2 (Lebanon Standard Time)
 const int daylightOffset_sec = 3600;  // Daylight offset: UTC+3 (Lebanon Daylight Time)
 
 // Enter Company Serial Number Here
-const int serialNumber = 123456; 
-
-
-const char* config_filename = "/config.json";
+const int serialNumber = 347896;
+String sn = "347896";
+int currentDataSize;
 const char* data_filename = "/data.txt";
-String name = "DefaultVehcileName";
-String type;
-int batterySize;
-int memorySize;
-int version;
-String sensors;
+String name = "name";
+String type = "type";
+int batterySize = 4000;
+int memorySize = 16;
+int version = 1;
+String sensors[] = { "gps", "temperature", "humidity" };
 bool wifi_connected = false;
 unsigned long lastTime = 0;
 bool configFetchingSucc = false;
 // const char* serverUrl = "http://192.168.33.99:3000/esp"; //hassan Tofayli
-const char* serverUrl = "http://192.168.1.109:3000/esp";
+const char* serverUrl = "http://192.168.1.106:3000/esp";
+const char* sendDataUrl = "http://192.168.1.106:3000/getdata";
+// const char* serverUrl = "http://192.168.1.109:3000/esp"; Home
+// const char* sendDataUrl = "http://192.168.1.109:3000/getdata"; Home
 // const char* serverUrl = "https://esp-dt.glitch.me/esp";
-DynamicJsonDocument configToSend(1024);
-DynamicJsonDocument dataToAppend(1024);
-DynamicJsonDocument dataToSend(60000);
+int arrayindex = 0;
+unsigned long previousMillis = 0;
+String configToSend = "";
+String dataToAppend = "";
+String dataToSend = "";
 WiFiManager wm;
 TinyGPSPlus gps;  // Create a TinyGPS++ object to handle GPS data
 WebServer server(80);
 Adafruit_MPU6050 mpu;
+String ipAddress;
 
+String travel_name;
+String travel_dest;
+String travel_tkn="notkn";
+String travel_year;
+String travel_month;
+String travel_day;
+String travel_hour;
+String travel_min;
+double latitudes[200];
+double longitudes[200];
 
 //File System Custom Functions
-void writeFile(String filename, String message) {
+bool writeFile(String filename, String message) {
   File file = LittleFS.open(filename, "w");
   if (!file) {
     Serial.println("writeFile -> failed to open file for writing");
-    return;
+    return false;
   }
   if (file.print(message))
     Serial.println("File written");
@@ -59,34 +76,8 @@ void writeFile(String filename, String message) {
     Serial.println("Write failed");
 
   file.close();
-}/*
-void appendToFile(String filename, String message) {
-  File file = LittleFS.open(filename, "a");
-  if (!file) {
-    Serial.println("writeFile -> failed to open file for writing");
-    writeFile(filename, message);
-    return;
-  }
-  if (file.print(message))
-    Serial.println("File updated: " + message);
-  else
-    Serial.println("append failed");
-
-  file.close();
+  return true;
 }
-String readFile(String filename) {
-  File file = LittleFS.open(filename);
-  if (!file) {
-    Serial.println("Failed to open file for reading");
-    return "";
-  }
-  String fileText = "";
-  while (file.available())
-    String fileText = file.readString();
-
-  file.close();
-  return fileText;
-}*/
 String printFile(const char* path) {
   // Open file for reading
   File file = LittleFS.open(path, "r");
@@ -103,34 +94,34 @@ String printFile(const char* path) {
 
 
 //File System Library Functions
-void readFile(fs::FS &fs, const char * path){
-    Serial.printf("Reading file: %s\r\n", path);
+void readFile(fs::FS& fs, const char* path) {
+  Serial.printf("Reading file: %s\r\n", path);
 
-    File file = fs.open(path, "r");
-    if(!file || file.isDirectory()){
-        Serial.println("- failed to open file for reading");
-        return;
+  File file = fs.open(path, "r");
+  if (!file || file.isDirectory()) {
+    Serial.println("- failed to open file for reading");
+    return;
+  }
+
+  Serial.printf("- read from file: %s\r\n", path);
+  String fileContent = "";
+
+  while (file.available()) {
+    char tmp = file.read();
+    if (tmp != -1) {
+      Serial.write(tmp);
+      fileContent += tmp;
     }
+  }
 
-    Serial.printf("- read from file: %s\r\n", path);
-    String fileContent="";
-    
-    while(file.available()){
-        char tmp = file.read();
-        if (tmp != -1) {
-            Serial.write(tmp);
-            fileContent += tmp;
-        }
-    }
-    dataToSend["sn"] = serialNumber;
-    dataToSend["fs"] = file.size();
-    // Serial.println("This is the FileContent from readFile: " + fileContent);
-    
-    file.close();
+  String serialNumberString = String(serialNumber);
+  int fileSize = serialNumberString.length() + file.size() + 10;
+  dataToSend = "sn=" + serialNumberString + "&fs=" + fileSize + fileContent;
+  Serial.println("readFile method fileContent: " + dataToSend);
+  file.close();
 
-    dataToSend["fc"] = fileContent.c_str();
-    Serial.printf("readFile: data: %s\r\n", path);
-}/*
+  Serial.printf("readFile: data: %s\r\n", path);
+} /*
 void writeFile(fs::FS &fs, const char * path, const char * message){
     Serial.printf("Writing file: %s\r\n", path);
 
@@ -146,174 +137,59 @@ void writeFile(fs::FS &fs, const char * path, const char * message){
     }
     file.close();
 }*/
-void appendFile(fs::FS &fs, const char * path, const char * message){
-    Serial.printf("Appending to file: %s\r\nMessage:", path);
-    Serial.println(message);
-    File file = fs.open(path, FILE_APPEND,true);
-    if(!file){
-        Serial.println("- failed to open file for appending");
-        return;
-    }
-    if(file.print(message)){
-        file.print(", ");
-        Serial.println(message);
-        Serial.print("- message appended - ");
-    } else {
-        Serial.println("- append failed");
-    }
-    file.close();
-}
-void renameFile(fs::FS &fs, const char * path1, const char * path2){
-    Serial.printf("Renaming file %s to %s\r\n", path1, path2);
-    if (fs.rename(path1, path2)) {
-        Serial.println("- file renamed");
-    } else {
-        Serial.println("- rename failed");
-    }
-}
-void deleteFile(fs::FS &fs, const char * path){
-    Serial.printf("Deleting file: %s\r\n", path);
-    if(fs.remove(path)){
-        Serial.println("- file deleted");
-    } else {
-        Serial.println("- delete failed");
-    }
-}
-
-
-
-//Configuration Functions ==> These functions are used to get the saved settings saved before on the esp memory
-bool saveConfig() {
-  // Create a JSON object
-  DynamicJsonDocument doc(1024);
-  doc["name"] = "name";
-  doc["type"] = "type";
-  doc["batterySize"] = 4000;
-  doc["memorySize"] = 16;
-  doc["version"] = 1;
-  doc["sensors"]["1"] = "gps";
-  doc["sensors"]["2"] = "temperature";
-  doc["sensors"]["3"] = "humidity";
-
-  String jsonString;
-  serializeJsonPretty(doc, jsonString);
-  Serial.println(jsonString);
-
-  String tmp = "";
-  if (serializeJson(doc, tmp) == 0) {  // return nb of successfully written characters
-    Serial.println("Failed to write config file!");
-    return false;
-  }
-  Serial.println(tmp);
-  writeFile(config_filename, tmp);
-
-  String s = printFile(config_filename);
-  Serial.print("The saved config is: \n" + s);
-
-  return true;
-}
-bool saveConfig(const char* json) {
-  StaticJsonDocument<512> doc;
-  // Parse the JSON document
-  auto error = deserializeJson(doc, json);
-  if (error) {
-    Serial.println("saveConfig -> Error parsing JSON");
-    return false;
-  }
-
-  // Read variables from JSON
-  name = doc["name"].as<String>();
-  type = doc["type"].as<String>();
-  batterySize = doc["batterySize"].as<int>();
-  memorySize = doc["memorySize"].as<int>();
-  version = doc["version"].as<int>();
-  sensors = doc["sensors"].as<String>();
-
-  File configFile = LittleFS.open(config_filename, "w");
-  if (!configFile) {
-    Serial.println("saveConfig -> Failed to open config file for writing");
-    return false;
-  }
-
-  if (configFile.print(json)) {
-    Serial.println("saveConfig -> Config file saved");
-  } else {
-    Serial.println("saveConfig -> Failed to write config file");
-    configFile.close();
-    return false;
-  }
-
-  configFile.close();
-
-  return true;
-}
-bool readConfig() {
-  File file = LittleFS.open(config_filename, "r");
+void appendFile(fs::FS& fs, const char* path, const char* message) {
+  Serial.printf("Appending to file: %s\r: Message:", path);
+  String messageUpdate = String(message) + ";";
+  // arrayindex++;
+  File file = fs.open(path, FILE_APPEND, true);
   if (!file) {
-    Serial.println("Failed to open file for reading");
+    Serial.println("- failed to open file for appending");
+    return;
   }
-  int config_file_size = file.size();
-  Serial.println("Config file size: " + String(config_file_size));
-
-  if (config_file_size > 512) {
-    Serial.println("Config file too large");
-    return false;
+  if (file.print(messageUpdate.c_str())) {
+    Serial.print(messageUpdate);
+    Serial.print(" - message appended - ");
+    currentDataSize = file.size();
+    Serial.print("\ncurrentDataSize: " + String(currentDataSize) + "\n");
+  } else {
+    Serial.println("- append failed");
   }
-  String config_data = file.readString();
-  StaticJsonDocument<512> doc;
-  auto error = deserializeJson(doc, config_data);
-  if (error) {
-    Serial.println("Error interpreting config file");
-    return false;
-  }
-
-  const String _name = doc["name"];
-  const String _type = doc["type"];
-  const int _batterySize = doc["batterySize"];
-  const int _memorySize = doc["memorySize"];
-  const int _version = doc["version"];
-
-
-  // Read the "sensors" array
-  const JsonArray& sensorsArray = doc["sensors"].as<JsonArray>();
-  const int _sensorsNumber = sensorsArray.size();
-  String _sensors[_sensorsNumber];
-  for (int i = 0; i < _sensorsNumber; ++i) {
-    _sensors[i] = sensorsArray[i].as<String>();
-  }
-
-  name = _name;
-  type = _type;
-  batterySize = _batterySize;
-  memorySize = _memorySize;
-  version = _version;
-
-  String sensors[_sensorsNumber];
-
-  // Copy the sensor names individually
-  for (int i = 0; i < _sensorsNumber; ++i) {
-    sensors[i] = _sensors[i];
-  }
-
-  return true;
+  file.close();
 }
-//Data Processing
-bool saveData(){
-  // File file = LittleFS.open(data_filename, "a", true);
-  // if (!file || file.isDirectory()) {
-  //   Serial.println("Failed to open file for reading, writing new file");
-  //   return false;
-  // }
-  // dataToAppend["fileSize"] = file.size();
-  printLocalTime();
-  // Serial.printf("Appending to file: %s\r\n", data_filename);
-  String jsonStr;
-  serializeJson(dataToAppend, jsonStr);
-  const char* t = jsonStr.c_str();
-  appendFile(LittleFS, data_filename,t);
+void renameFile(fs::FS& fs, const char* path1, const char* path2) {
+  Serial.printf("Renaming file %s to %s\r\n", path1, path2);
+  if (fs.rename(path1, path2)) {
+    Serial.println("- file renamed");
+  } else {
+    Serial.println("- rename failed");
+  }
+}
+void deleteFile(fs::FS& fs, const char* path) {
+  File file = LittleFS.open(path, "w");
+  if (file) {
+    file.close();
+    Serial.println("\nFile cleared successfully");
+  } else {
+    Serial.println("\nFailed to clear file");
+  }
+  // arrayindex=0;
+  Serial.printf("Deleting file: %s\r\n", path);
+  if (fs.remove(path)) {
+    Serial.println("\n\n- file deleted\n\n");
+  } else {
+    Serial.println("\n\n- delete failed\n\n");
+  }
+}
 
-  Serial.println("dataToAppend content as JSON:");
-  Serial.println(jsonStr);
+
+
+
+//Data Processing
+bool saveData() {
+  const char* t = dataToAppend.c_str();
+  appendFile(LittleFS, data_filename, t);
+  Serial.print("dataToAppend content as String:");
+  Serial.println(dataToAppend);
   return true;
 }
 
@@ -348,66 +224,13 @@ String httpGETRequest(const char* serverName) {
 
   return payload;
 }
-String searchJson(String jsonContent) {
-  DynamicJsonDocument doc(1024);
-  deserializeJson(doc, jsonContent);
-
-  // Search for the key that matches the serial number
-  JsonObject obj = doc.as<JsonObject>();
-  String key = "serial-" + String(serialNumber);
-  if (obj.containsKey(key)) {
-    Serial.print("Found key: ");
-    Serial.println(key);
-    return obj[key].as<String>();  // Return the value associated with the key
-  }
-
-  return "false";  // Return "false" if the key is not found
-}
 void sendConfig(String data) {
   HTTPClient http;
   http.begin(serverUrl);
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.addHeader("X-Device", "ESP32");
-  http.addHeader("X-Sensor", "DHT11");
-  http.addHeader("X-Temp", "25");
-  http.addHeader("X-Humidity", "50");
-  configToSend["serialNumber"] = serialNumber;
-  configToSend["message"] = data;
-  configToSend["timestamp"] = millis();
-
-
-  String requestBody;
-  serializeJson(configToSend, requestBody);
-  Serial.println(requestBody);
-  int httpResponse = http.POST(requestBody);
-  if (httpResponse > 0) {
-    Serial.print("HTTP Response code: ");
-    Serial.println(httpResponse);
-    String response = http.getString();
-    Serial.println(response);
-  } else {
-    Serial.print("HTTP Error code: ");
-    Serial.println(httpResponse);
-  }
-  http.end();
-}
-void sendJSON(String data) {
-  HTTPClient http;
-  http.begin(serverUrl);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device", "ESP32");
-  http.addHeader("X-Sensor", "DHT11");
-  http.addHeader("X-Temp", "25");
-  http.addHeader("X-Humidity", "50");
-  configToSend["serialNumber"] = serialNumber;
-  configToSend["message"] = data;
-  configToSend["timestamp"] = millis();
-
-
-  String requestBody;
-  serializeJson(configToSend, requestBody);
-  Serial.println(requestBody);
-  int httpResponse = http.POST(requestBody);
+  http.addHeader("sn", sn);
+  http.addHeader("dataSize", String(currentDataSize));
+  int httpResponse = http.POST(configToSend);
   if (httpResponse > 0) {
     Serial.print("HTTP Response code: ");
     Serial.println(httpResponse);
@@ -425,6 +248,10 @@ bool printLocalTime() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     Serial.println("Failed to obtain time");
+    String time = "time=0-0-0-0-0-0";
+    Serial.print(time);
+    dataToAppend += time;
+    configToSend += time;
     return false;
   }
   int dayOfWeek = timeinfo.tm_wday;
@@ -436,40 +263,28 @@ bool printLocalTime() {
   int second = timeinfo.tm_sec;
 
   Serial.print("Day of the week: ");
-  Serial.println(dayOfWeek);
-  Serial.print("Month: ");
-  Serial.println(month);
-  Serial.print("Day of the Month: ");
-  Serial.println(dayOfMonth);
-  Serial.print("Year: ");
-  Serial.println(year);
-  Serial.print("Hour: ");
-  Serial.println(hour);
-  Serial.print("Minute: ");
-  Serial.println(minute);
-  Serial.print("Second: ");
+  Serial.print(dayOfWeek);
+  Serial.print(", Month: ");
+  Serial.print(month);
+  Serial.print(", Day of the Month: ");
+  Serial.print(dayOfMonth);
+  Serial.print(", Year: ");
+  Serial.print(year);
+  Serial.print(", Hour: ");
+  Serial.print(hour);
+  Serial.print(", Minute: ");
+  Serial.print(minute);
+  Serial.print(", Second: ");
   Serial.println(second);
 
-  //
-  // Set the time components in the JSON object
-  configToSend["time"]["dayOfWeek"] = dayOfWeek;
-  configToSend["time"]["month"] = month;
-  configToSend["time"]["dayOfMonth"] = dayOfMonth;
-  configToSend["time"]["year"] = year;
-  configToSend["time"]["hour"] = hour;
-  configToSend["time"]["minute"] = minute;
-  configToSend["time"]["second"] = second;
-
-  //update dataToAppend
-  dataToAppend["t"]["m"] = month;
-  dataToAppend["t"]["d"] = dayOfMonth;
-  dataToAppend["t"]["y"] = year;
-  dataToAppend["t"]["h"] = hour;
-  dataToAppend["t"]["min"] = minute;
-  dataToAppend["t"]["s"] = second;
-
+  // Update dataToAppend
+  String time = "time=" + String(year) + "-" + String(month) + "-" + String(dayOfMonth) + "-" + String(hour) + "-" + String(minute) + "-" + String(second);
+  Serial.print(time);
+  dataToAppend += time + ",";
+  configToSend += time;
   return true;
 }
+
 
 
 
@@ -501,34 +316,223 @@ void handleRoot() {
   server.send(200, "text/html", temp);
 }
 void sendUpdate() {
-  configToSend["timestamp"] = millis();
-  printLocalTime();
-  String str;
-  serializeJson(configToSend, str);
-  server.send(200, "text/json", str);
+  configToSend += "&millis=" + String(millis());
+  server.send(200, "text/plain", configToSend);
+  int startIndex = configToSend.indexOf("&millis=");
+  configToSend = configToSend.substring(0, startIndex);
 }
-void deleteData(){
+void sendTravelData() {
+  const char* trv = "/travel.txt";
+  sendDataInChunks(trv,false);
+  server.send(200, "text/plain", "OK");
+}
+void deleteData() {
   deleteFile(LittleFS, data_filename);
-  server.send(200,"text/plain","filedeleted");
+  server.send(200, "text/plain", "filedeleted");
 }
-void sendData(){
-  readFile(LittleFS, data_filename);
-  String str;
-  serializeJson(dataToSend, str);
-  // Serial.println("sentData: after request from server: " + str);
-   Serial.println("sentData");
-  dataToSend["fc"] = "";
-  dataToSend["fs"] = "";
+void sendData() {
+  // readFile(LittleFS, data_filename);
+  sendDataInChunks(data_filename, true);
+  Serial.println("sentData: after request from server: ");
+  server.send(200, "text/plain", "sent to /esp");
+  dataToSend = "";
 
-  server.send(200, "text/json", str);
   delay(10);
-  // sendConfig(dt);
-  // sendJSON(dt);
 }
+void sendDataInChunks(const char* path, bool del) {
+  bool received = del;
+  if (LittleFS.exists(path)) {
+    File file = LittleFS.open(path, "r");
+
+    HTTPClient http;
+
+
+    size_t file_size = file.size();
+    // int file_size_int = file.size();
+    size_t chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;  // Calculate number of chunks
+    // String fs = String(file_size);
+
+
+    for (int i = 0; i < chunks; i++) {
+      http.begin(sendDataUrl);  //Specify destination for HTTP request
+      http.addHeader("Content-Type", "text/plain");
+      http.addHeader("sn", sn);
+      http.addHeader("tkn", travel_tkn);
+      // http.addHeader("fs=", fs);
+      char buffer[CHUNK_SIZE + 1];
+      int bytesRead = file.readBytes(buffer, CHUNK_SIZE);
+      buffer[bytesRead] = '\0';  // null terminate the buffer
+      Serial.println(buffer);
+      // Now send this chunk to the server
+      int httpResponseCode = http.POST(buffer);  //Send the request
+
+      if (httpResponseCode > 0) {
+        String response = http.getString();      //Get the response to the request
+        Serial.print(httpResponseCode + " - ");  //Print return code
+        Serial.println(response);                //Print request response payload
+      } else {
+        Serial.print("Error on sending POST: ");
+        Serial.println(httpResponseCode);
+        received = false;
+      }
+
+      http.end();  //Free resources
+    }
+
+    file.close();
+
+
+
+  } else {
+    Serial.println("File does not exist.");
+    received = false;
+  }
+  if (received)
+    deleteFile(LittleFS, path);
+}
+
+
+void handleGetTravel() {
+  String message = "This is message from handleGetTravel\n";
+
+
+  for (int i = 0; i < server.args(); i++) {
+    String argname = server.argName(i);
+    String arg = server.arg(i);
+    //ROUTE
+    if (argname == "route") {
+
+      Serial.print("I am arg==rout");
+      StaticJsonDocument<512> doc;
+      deserializeJson(doc, arg);
+      JsonArray array = doc.as<JsonArray>();
+
+      // Iterate over the array and extract latitude and longitude values
+      for (int i = 0; i < array.size(); i++) {
+        JsonObject obj = array[i];
+        double lat = obj["lat"];
+        double lng = obj["lng"];
+        latitudes[i] = lat;
+        longitudes[i] = lng;
+      }
+
+      // Print extracted values
+      for (int i = 0; i < 19; i++) {
+        Serial.print("Latitude ");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.println(latitudes[i], 6);
+        Serial.print("Longitude ");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.println(longitudes[i], 6);
+      }
+    }
+    else if (argname=="name"){
+      travel_name = arg;
+    } else if (argname=="destination"){
+      travel_dest = arg;
+    } else if (argname=="dataToken"){
+      travel_tkn = arg;
+    } else if (argname == "year") {
+      travel_year = arg;
+    } else if (argname == "month") {
+      travel_month = arg;
+    } else if (argname == "day") {
+      travel_day = arg;
+    } else if (argname == "hour") {
+      travel_hour = arg;
+    } else if (argname == "minutes") {
+      travel_min = arg;
+    }
+
+    message += argname + ": ";
+    message += arg;
+  }
+  Serial.println(message);
+  // Send the message in response
+  server.send(200, "text/plain", message);
+  message = "";
+
+  File file = LittleFS.open("/travel.txt", "w");
+  if (file) {
+    file.print(travel_name);
+    file.print(",");
+    file.print(travel_dest);
+    file.print(",");
+    file.print(travel_tkn);
+    file.print(",");
+    file.print(travel_year);
+    file.print(",");
+    file.print(travel_month);
+    file.print(",");
+    file.print(travel_day);
+    file.print(",");
+    file.print(travel_hour);
+    file.print(",");
+    file.print(travel_min);
+    file.print(",");
+    for (int i = 0; i < 19; i++) {
+      file.print(latitudes[i], 6);
+      file.print(",");
+      file.print(longitudes[i], 6);
+      file.print(",");
+    }
+    file.close();
+  } else {
+    Serial.println("Failed to open file for writing");
+  }
+
+} /*
+void handleTravelGet() {
+  server
+  String data = "nothing\n";
+
+  static DynamicJsonDocument jsonBuffer(1024);
+  if (server.hasArg("plain") == false){ //Check for any body
+  for (int i = 0; i < server.headers(); i++) {
+    String headerName = server.headerName(i);
+    String header = server.header(i);
+    data += headerName + ": " + header+"\n"; 
+    Serial.print(headerName + ": " + header);
+  }
+    // data += data+"\nthe server.args="+Stringa(server.args());
+    server.send(200, "text/plain", "Body not received, "+data);
+    return;
+  }
+
+  for (int i = 0; i < server.headers(); i++) {
+    String headerName = server.headerName(i);
+    String header = server.header(i);
+    data += headerName + ": " + header+"\n"; 
+    Serial.print(headerName + ": " + header);
+  }
+    server.send(200, "text/plain", "Body not received, " +data);
+
+}
+*/
+
+
+void saveJSONData(const char* filename, const String& jsonData) {
+  File file = LittleFS.open(filename, "w");
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+
+  file.print(jsonData);
+  file.close();
+}
+
+
+
+
 
 
 //these functions are meant to proccess sernsors and there values
 bool getGPS() {
+  String values = "&updated=false&lat=0&lng=0";
+  String valuesToAppend = ",updated=false,lat=0,lng=0";
   bool updated = false;
   // Read data from the GPS module
   while (Serial2.available() > 0) {
@@ -538,13 +542,15 @@ bool getGPS() {
         // Retrieve latitude and longitude
         float latitude = gps.location.lat();
         float longitude = gps.location.lng();
-        configToSend["gps"]["latitude"] = latitude;
-        configToSend["gps"]["longitude"] = longitude;
-        // Create a string to store the formatted latitude and longitude
+        values = "&updated=true&lat=" + String(latitude) + "&lng=" + String(longitude);
+        valuesToAppend = ",updated=true,lat=" + String(latitude) + ",lng=" + String(longitude);
         updated = true;
       }
     }
   }
+  configToSend += values;
+  dataToAppend += valuesToAppend;
+  Serial.println(valuesToAppend);
   return updated;
 }
 void setupAccelerometer() {
@@ -615,23 +621,21 @@ void setupAccelerometer() {
       break;
   }
 }
-void getAccelerometer(){
+void getAccelerometer() {
   /* Get new sensor events with the readings */
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-  /* Add accelerometer values */
-  configToSend["accelerometer"]["AccelerationX"] = a.acceleration.x;
-  configToSend["accelerometer"]["AccelerationY"] = a.acceleration.y;
-  configToSend["accelerometer"]["AccelerationZ"] = a.acceleration.z;
 
-  /* Add gyroscope values */
-  configToSend["gyroscope"]["RotationX"] = g.gyro.x;
-  configToSend["gyroscope"]["RotationY"] = g.gyro.y;
-  configToSend["gyroscope"]["RotationZ"] = g.gyro.z;
+  configToSend += "&accelerationX=" + String(a.acceleration.x);
+  configToSend += "&accelerationY=" + String(a.acceleration.y);
+  configToSend += "&accelerationZ=" + String(a.acceleration.z);
 
-  /* Add temperature value */
-  configToSend["temperature"] = temp.temperature;
-  dataToAppend["tmp"] = temp.temperature;
+  configToSend += "&rotationX=" + String(g.gyro.x);
+  configToSend += "&rotationY=" + String(g.gyro.y);
+  configToSend += "&rotationZ=" + String(g.gyro.z);
+
+  configToSend += "&temperature=" + String(temp.temperature);
+  dataToAppend += "tmp=" + String(temp.temperature);
 
   /* Print out the values */
   Serial.print("Acceleration X: ");
@@ -640,57 +644,53 @@ void getAccelerometer(){
   Serial.print(a.acceleration.y);
   Serial.print(", Z: ");
   Serial.print(a.acceleration.z);
-  Serial.println(" m/s^2");
+  Serial.print(" m/s^2");
 
-  Serial.print("Rotation X: ");
+  Serial.print(", Rotation X: ");
   Serial.print(g.gyro.x);
   Serial.print(", Y: ");
   Serial.print(g.gyro.y);
   Serial.print(", Z: ");
   Serial.print(g.gyro.z);
-  Serial.println(" rad/s");
+  Serial.print(" rad/s");
 
-  Serial.print("Temperature: ");
+  Serial.print(", Temperature: ");
   Serial.print(temp.temperature);
   Serial.println(" degC");
-
-  Serial.println("");
 }
 
 
-void getMemory(){
+
+void getMemory() {
   // Calculate size of configToSend
-  size_t dataSize = measureJson(configToSend);
+  size_t dataSize = configToSend.length();
   Serial.print("Size of configToSend: ");
-  Serial.println(dataSize);
+  Serial.print(dataSize);
 
   // Get the total free space
   size_t totalBytes = LittleFS.totalBytes();
-  Serial.print("Total free space: ");
-  Serial.println(totalBytes);
+  Serial.print(", Total free space: ");
+  Serial.print(totalBytes);
 
   // Get the used space
   size_t usedBytes = LittleFS.usedBytes();
-  Serial.print("Used space: ");
+  Serial.print(", Used space: ");
   Serial.println(usedBytes);
 
   // Fill LittleFS information in configToSend
-  configToSend["memory"]["totalBytes"] = totalBytes;
-  configToSend["memory"]["usedBytes"] = usedBytes;
-  configToSend["memory"]["dataSize"] = dataSize;
+  configToSend += "&totalBytes=" + String(totalBytes);
+  configToSend += "&usedBytes=" + String(usedBytes);
 }
-
-
 
 void setup() {
   Serial.begin(115200);
   // neogps.begin(9600, SERIAL_8N1, 16, 17);  // Initialize the GPS module serial port at 9600 baud
   wm.setConfigPortalBlocking(true);
   // wm.setTimeout(30);
-  while(!wm.autoConnect("ESP32-HassanTofayli")){
-        Serial.println("connecting... :)");
-    }
-  sendConfig("hi from beg");
+  while (!wm.autoConnect("ESP32-HassanTofayli")) {
+    Serial.println("connecting... :)");
+  }
+  sendConfig("Hello from esp, sn=" + String(serialNumber));
 
 
   if (!LittleFS.begin(false)) {
@@ -700,25 +700,11 @@ void setup() {
       Serial.println("setup -> LITTLEFS mount failed");
       Serial.println("setup -> Formatting not possible");
       return;
-    } else {
-      Serial.println("setup -> The file system is formatted");
-    }
-  } else {
-    Serial.println("setup -> LITTLEFS mounted successfully");
-    Serial.print("config file before: ");
-    Serial.print(printFile(config_filename));
+    } else Serial.println("setup -> The file system is formatted");
+  } else Serial.println("setup -> LITTLEFS mounted successfully");
 
-    if (readConfig() == false) {
-      Serial.println("setup -> Could not read Config file -> initializing new file");
-      if (saveConfig()) {
-        Serial.println("setup -> Config file saved with content: ");
-        printFile(config_filename);
-      }
-    }
-  }
   Serial.println("My serialNumber is: " + String(serialNumber));
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  printLocalTime();
 
   // accelometer gyroscope temprature sensor
   setupAccelerometer();
@@ -733,6 +719,8 @@ void setup() {
   server.on("/getUpdate", sendUpdate);
   server.on("/sendData", sendData);
   server.on("/deleteData", deleteData);
+  server.on("/sendTravel", HTTP_GET, handleGetTravel);
+  server.on("/sendTravelData", HTTP_GET, sendTravelData);
 
   server.begin();
   Serial.println("HTTP server started");
@@ -746,14 +734,19 @@ void setup() {
 }
 
 void loop() {
+  unsigned long currentMillis = millis();
   if (WiFi.isConnected() || WiFi.status() != WL_CONNECTED) {
     // wm.stopConfigPortal();
-    Serial.print("WiFi connected: ");
-    Serial.println(WiFi.localIP());
-    String ipAddress = WiFi.localIP().toString();
-    configToSend["ip_address"] = ipAddress;
+    if (currentMillis - previousMillis >= 5000) {
+      Serial.print(" -WiFi connected: ");
+      Serial.print(WiFi.localIP());
+      ipAddress = WiFi.localIP().toString();
+    }
   } else {
-    Serial.println("No WiFi connected");
+    if (currentMillis - previousMillis >= 1000) {
+      ipAddress = "0.0.0.0";
+      Serial.print("No WiFi connected");
+    }
     wm.setConfigPortalBlocking(false);
     wifi_connected = wm.autoConnect("ESP32-HassanTofayli");
     if (wifi_connected) {
@@ -762,26 +755,21 @@ void loop() {
     }
   }
   server.handleClient();
-  delay(1000);
+  delay(2);
+  // delay(500);
 
-  configToSend["currentTime"] = printLocalTime();
 
-  configToSend["gps"]["updated"] = getGPS();
-
-  getAccelerometer();
-
-  getMemory();
-
-  unsigned long currentMillis = millis();
-  unsigned long previousMillis = 0;
-  if (currentMillis - previousMillis >= 4000) {
+  if (currentMillis - previousMillis >= 5000) {
+    configToSend = "sn=" + String(serialNumber) + "&";
+    configToSend += "&ip_address=" + ipAddress + "&";
+    dataToAppend = "";
+    printLocalTime();
+    getAccelerometer();
+    getGPS();
+    getMemory();
     saveData();
+    sendConfig("");
+    sendDataInChunks(data_filename, true);
     previousMillis = currentMillis;
   }
-
-  
-  // sendData();
-
-  // sendConfig(dt);
-  // sendJSON(dt);
 }
